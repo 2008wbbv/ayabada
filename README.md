@@ -51,6 +51,12 @@ pytest                                   # 70 tests, all offline
 # → confidence brain → markdown handoff
 ayabada demo
 
+# Web dashboard (zero dependencies): live gate state, z-score chart with
+# thresholds and wake markers, per-metric small multiples, incident table
+# with handoff viewer. Demo feed is time-compressed (1 tick = 15 min).
+ayabada dashboard                        # http://127.0.0.1:8787/
+ayabada dashboard --csv metrics.csv      # replay real metrics instead
+
 # Scored benchmark, offline plumbing check (scripted model)
 ayabada bench fetch --limit 1
 ayabada bench run --limit 1 --dry-run

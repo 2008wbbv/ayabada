@@ -171,6 +171,13 @@ def cmd_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    from ayabada.shell.dashboard import run_dashboard
+
+    run_dashboard(host=args.host, port=args.port, csv_path=args.csv, tick_seconds=args.tick)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ayabada", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -202,6 +209,16 @@ def build_parser() -> argparse.ArgumentParser:
     demo = sub.add_parser("demo", help="offline end-to-end demo (no API key)")
     demo.add_argument("--out", default="handoff-demo.md", help="handoff output path")
     demo.set_defaults(func=cmd_demo)
+
+    dashboard = sub.add_parser("dashboard", help="web dashboard (heartbeat + incidents)")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8787)
+    dashboard.add_argument("--csv", help="replay a metrics CSV instead of the synthetic demo feed")
+    dashboard.add_argument(
+        "--tick", type=float, default=1.0,
+        help="seconds per 15-min interval in demo mode (time compression)",
+    )
+    dashboard.set_defaults(func=cmd_dashboard)
 
     return parser
 
