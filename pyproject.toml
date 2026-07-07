@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ayabada"
+version = "0.1.0"
+description = "Self-hosting DevOps/SRE agent with a calibrated-stopping brain, evaluated on ITBench-AA"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.100"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+ayabada = "ayabada.shell.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ayabada*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

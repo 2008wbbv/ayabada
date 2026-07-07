@@ -1,0 +1,18 @@
+# Local-network self-host. Product scope only — nothing here participates
+# in scored benchmark runs.
+#
+#   docker compose run --rm agent demo            # offline end-to-end demo
+#   docker compose run --rm agent heartbeat replay /data/metrics.csv
+#   ANTHROPIC_API_KEY=... docker compose run --rm agent bench run --limit 3
+services:
+  agent:
+    build: .
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      - ayabada-data:/data
+      - itbench-cache:/root/.cache/ayabada
+
+volumes:
+  ayabada-data:
+  itbench-cache:
