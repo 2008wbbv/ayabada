@@ -72,6 +72,48 @@ def test_no_raw_dir_is_graceful():
     assert tb.execute("read_telemetry", {"file": "x"}).startswith("Error")
 
 
+def test_query_metrics_lists_and_summarizes_files(tmp_path):
+    metrics_dir = tmp_path / "metrics"
+    metrics_dir.mkdir()
+    header = "metric_name\ttimestamp\tvalue\tpod_name\tnamespace\ttags\n"
+    rows = []
+    for i in range(20):
+        rows.append(f"container_cpu_usage\t2025-12-15 17:{i:02d}:00\t{0.1 + (0.5 if i >= 15 else 0):.3f}\tcart-abc\tdemo\t{{}}\n")
+        rows.append(f"container_memory_bytes\t2025-12-15 17:{i:02d}:00\t{1000 + i}\tcart-abc\tdemo\t{{}}\n")
+    (metrics_dir / "pod_cart-abc_raw.tsv").write_text(header + "".join(rows))
+
+    tb = SnapshotToolbox(snapshot(tmp_path))
+    listing = tb.execute("query_metrics", {})
+    assert "cart-abc" in listing
+
+    summary = tb.execute("query_metrics", {"entity": "cart"})
+    assert "container_cpu_usage" in summary and "container_memory_bytes" in summary
+    assert "rising" in summary  # cpu jumps 0.1 -> 0.6 in the last quarter
+    assert "n=20" in summary
+
+    filtered = tb.execute("query_metrics", {"entity": "cart", "metric": "memory"})
+    assert "container_memory_bytes" in filtered and "container_cpu_usage" not in filtered
+
+
+def test_query_metrics_over_in_memory_series():
+    from ayabada.snapshot import MetricSeries
+
+    snap = IncidentSnapshot(
+        id="t", source="heartbeat",
+        metrics=(MetricSeries(metric="error_rate", entity="error_rate",
+                              samples=tuple((float(i), 0.01) for i in range(8))),),
+    )
+    tb = SnapshotToolbox(snap)
+    out = tb.execute("query_metrics", {"entity": "error_rate"})
+    assert "error_rate" in out and "n=8" in out and "flat" in out
+
+
+def test_query_metrics_no_match():
+    tb = SnapshotToolbox(snapshot())
+    assert "No metrics found" in tb.execute("query_metrics", {"entity": "nothing-here"})
+    assert "No metric telemetry" in tb.execute("query_metrics", {})
+
+
 def test_truncation():
     events = tuple(
         {"timestamp": f"t{i}", "type": "Warning", "reason": "R", "object": f"pod-{i}", "kind": "Pod", "message": "m" * 200, "count": 1}

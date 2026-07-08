@@ -78,6 +78,87 @@ def cmd_bench_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bench_calibration(args: argparse.Namespace) -> int:
+    from ayabada.bench.calibration import calibration_from_records
+
+    scenarios = load_manifest()
+    ground_truths = {s.scenario_id: s.ground_truth for s in scenarios}
+    reports = calibration_from_records(
+        Path(args.records), ground_truths, n_bins=args.bins
+    )
+    if not reports:
+        print("no confidence traces in records (baseline-only run?)", file=sys.stderr)
+        return 1
+    for report in reports.values():
+        print(report.to_markdown())
+        print()
+    if args.out:
+        Path(args.out).write_text(
+            json.dumps({arm: r.to_dict() for arm, r in reports.items()}, indent=2)
+        )
+        print(f"json: {args.out}")
+    return 0
+
+
+def cmd_bench_export(args: argparse.Namespace) -> int:
+    from ayabada.bench.export import export_predictions
+
+    scenarios = load_manifest()
+    ground_truths = {s.scenario_id: s.ground_truth for s in scenarios}
+    bundle = export_predictions(Path(args.records), ground_truths, arm=args.arm)
+    Path(args.out).write_text(json.dumps(bundle, indent=2))
+    print(f"{bundle['n_scenarios']} scenario(s) exported for arm '{args.arm}': {args.out}")
+    return 0
+
+
+def cmd_bench_sweep(args: argparse.Namespace) -> int:
+    from ayabada.bench.sweep import sweep_arms, sweep_markdown, sweep_table
+
+    scenarios = _select_scenarios(args.scenario, args.limit)
+    if not scenarios:
+        print("no scenarios selected", file=sys.stderr)
+        return 2
+
+    def parse_floats(text: str) -> list[float]:
+        return [float(x) for x in text.split(",") if x.strip()]
+
+    def parse_ints(text: str) -> list[int]:
+        return [int(x) for x in text.split(",") if x.strip()]
+
+    arms = sweep_arms(
+        stop_thresholds=parse_floats(args.stop_thresholds),
+        escalate_thresholds=parse_floats(args.escalate_thresholds),
+        patiences=parse_ints(args.patiences),
+        checkpoint_everys=parse_ints(args.checkpoint_every),
+    )
+    print(f"{len(arms)} arms: {', '.join(a.name for a in arms)}")
+
+    if args.dry_run:
+        from ayabada.llm.mock import ScriptedLLM
+
+        def factory():
+            return ScriptedLLM(
+                script=[
+                    {"text": "alerts", "tool": "get_alerts", "input": {}},
+                    '{"confidence": 0.7, "hypothesis": [{"name": "frontend", "kind": "Service"}], "rationale": "demo"}',
+                ]
+            )
+    else:
+        from ayabada.llm.anthropic_client import AnthropicClient
+
+        def factory():
+            return AnthropicClient(model=args.model)
+
+    out_dir = Path(args.out)
+    result = run_head_to_head(scenarios, factory, arms, out_dir=out_dir)
+    rows = sweep_table(result)
+    print()
+    print(sweep_markdown(rows))
+    (out_dir / "sweep.json").write_text(json.dumps(rows, indent=2))
+    print(f"\nsweep table: {out_dir / 'sweep.json'}")
+    return 0
+
+
 def cmd_heartbeat_replay(args: argparse.Namespace) -> int:
     from ayabada.heartbeat.monitor import Heartbeat, HeartbeatConfig
 
@@ -181,6 +262,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         tick_seconds=args.tick,
         model=args.model,
         services_path=args.services,
+        prometheus_path=args.prometheus,
+        db_path=args.db,
+        notify_urls=args.notify,
+        notify_format=args.notify_format,
+        token=args.token,
     )
     return 0
 
@@ -205,6 +291,34 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--out", default="results", help="output directory")
     run.add_argument("--dry-run", action="store_true", help="scripted model, no API key")
     run.set_defaults(func=cmd_bench_run)
+
+    calibration = bench_sub.add_parser(
+        "calibration", help="reliability-diagram data from a run's confidence traces"
+    )
+    calibration.add_argument("--records", default="results/records.jsonl")
+    calibration.add_argument("--bins", type=int, default=10)
+    calibration.add_argument("--out", help="also write JSON report here")
+    calibration.set_defaults(func=cmd_bench_calibration)
+
+    export = bench_sub.add_parser(
+        "export", help="export predictions for leaderboard submission / scorer cross-check"
+    )
+    export.add_argument("--records", default="results/records.jsonl")
+    export.add_argument("--arm", default="confidence")
+    export.add_argument("--out", default="submission.json")
+    export.set_defaults(func=cmd_bench_export)
+
+    sweep = bench_sub.add_parser("sweep", help="ablation sweep over stopping-policy grid")
+    sweep.add_argument("--scenario", action="append", help="scenario id (repeatable)")
+    sweep.add_argument("--limit", type=int, help="first N scenarios")
+    sweep.add_argument("--model", default="claude-opus-4-8", help="base model (all arms)")
+    sweep.add_argument("--stop-thresholds", default="0.6,0.8,0.9")
+    sweep.add_argument("--escalate-thresholds", default="0.35")
+    sweep.add_argument("--patiences", default="3")
+    sweep.add_argument("--checkpoint-every", default="1")
+    sweep.add_argument("--out", default="results-sweep", help="output directory")
+    sweep.add_argument("--dry-run", action="store_true", help="scripted model, no API key")
+    sweep.set_defaults(func=cmd_bench_sweep)
 
     heartbeat = sub.add_parser("heartbeat", help="production wake trigger")
     hb_sub = heartbeat.add_subparsers(dest="heartbeat_command", required=True)
@@ -233,6 +347,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--services",
         help="YAML file of services to health-check (http/tcp/docker/command); "
         "default: demo self-checks",
+    )
+    dashboard.add_argument(
+        "--prometheus",
+        help="YAML file mapping heartbeat metrics to PromQL queries; polls a "
+        "real Prometheus instead of the demo feed",
+    )
+    dashboard.add_argument(
+        "--db",
+        help="SQLite path for persistence (baseline, incidents, service events "
+        "survive restarts); default: in-memory only",
+    )
+    dashboard.add_argument(
+        "--notify", action="append",
+        help="webhook URL notified on wakes and service transitions (repeatable)",
+    )
+    dashboard.add_argument(
+        "--notify-format", choices=["json", "ntfy", "slack"], default="json",
+    )
+    dashboard.add_argument(
+        "--token",
+        help="require this bearer token on every request (or set AYABADA_TOKEN)",
     )
     dashboard.set_defaults(func=cmd_dashboard)
 

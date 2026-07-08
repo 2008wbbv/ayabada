@@ -59,6 +59,12 @@ ayabada dashboard                        # http://127.0.0.1:8787/
 ayabada dashboard --csv metrics.csv      # replay real metrics instead
 ayabada dashboard --services services.yml  # health-check your own services
 
+# Production shape: poll a real Prometheus, persist state across restarts,
+# notify a webhook on wakes and service transitions, require a token on LAN
+ayabada dashboard --prometheus prometheus.yml --db /data/ayabada.db \
+    --notify https://ntfy.sh/my-topic --notify-format ntfy \
+    --token "$AYABADA_TOKEN" --host 0.0.0.0
+
 # Scored benchmark, offline plumbing check (scripted model)
 ayabada bench fetch --limit 1
 ayabada bench run --limit 1 --dry-run
@@ -66,6 +72,15 @@ ayabada bench run --limit 1 --dry-run
 # Real scored run (both arms, same model, same tools)
 export ANTHROPIC_API_KEY=...
 ayabada bench run --limit 5 --model claude-opus-4-8 --out results/
+
+# Ablation sweep: the mechanism at many operating points, one parity-checked run
+ayabada bench sweep --limit 5 --stop-thresholds 0.6,0.8,0.9 --patiences 2,3
+
+# Calibration: is the reported confidence worth anything? (reliability bins + ECE)
+ayabada bench calibration --records results/records.jsonl
+
+# Export predictions for leaderboard submission / scorer cross-check
+ayabada bench export --records results/records.jsonl --out submission.json
 
 # Replay production metrics through the wake gate
 ayabada heartbeat replay metrics.csv     # wide CSV: timestamp, metric columns
@@ -103,6 +118,38 @@ holds a streak through borderline intervals; a cooldown stops re-waking on
 the same episode; flagged special days (Black Friday) widen the bands. In
 the included simulation it produces zero false wakes over three clean weeks
 and exactly one wake per injected incident.
+
+## Production ingestion, persistence, notifications
+
+- **Prometheus** — `--prometheus prometheus.yml` maps heartbeat metric names
+  to PromQL instant queries and polls them on the heartbeat interval:
+
+  ```yaml
+  prometheus:
+    url: http://prometheus:9090
+    interval: 900            # seconds per heartbeat interval
+  queries:
+    traffic: sum(rate(http_requests_total[5m]))
+    error_rate: sum(rate(http_requests_total{code=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+    p95_latency_ms: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) * 1000
+  ```
+
+  Failed queries drop that metric for the interval (corroboration still
+  applies to what arrived); a forgotten `sum()` is summed loudly, not
+  silently.
+- **Persistence** — `--db path.db` stores every observation, incident and
+  service transition in SQLite. On restart the seasonal baseline, chart
+  window, gate state, incidents and handoffs are rebuilt by replaying the
+  store (wakes during replay do not re-run the brain); observations past a
+  5-week retention window are pruned.
+- **Notifications** — `--notify URL` (repeatable) posts on every wake
+  outcome (diagnosed/escalated) and every watched-service up/down
+  transition. `--notify-format json|ntfy|slack`. Delivery failures are
+  counted on the services panel, never raised.
+- **Token auth** — `--token` (or `AYABADA_TOKEN`) requires
+  `Authorization: Bearer <token>` on every request; browsers bootstrap via
+  `/?token=<token>`, which sets an HttpOnly session cookie. Constant-time
+  comparison; enable it before binding to `0.0.0.0`.
 
 ## Watched services
 

@@ -168,6 +168,15 @@ class ServiceRegistry:
         self._was_down: dict[str, bool] = {}
         self._events: deque[dict[str, Any]] = deque(maxlen=EVENTS)
         self.checks_performed = 0
+        # Called with each up/down transition event, outside the lock —
+        # the dashboard hooks persistence and notifications here.
+        self.on_transition: Callable[[dict[str, Any]], None] | None = None
+
+    def seed_events(self, events: list[dict[str, Any]]) -> None:
+        """Restore a persisted transition log (newest-first input)."""
+        with self._lock:
+            for event in reversed(events):
+                self._events.appendleft(event)
 
     def add(self, check: ServiceCheck) -> None:
         if check.kind not in self._checkers:
@@ -195,6 +204,7 @@ class ServiceRegistry:
         """Execute one check (outside the lock) and record the result."""
         result = self._checkers[check.kind](check)
         now = time.monotonic() if now is None else now
+        event: dict[str, Any] | None = None
         with self._lock:
             self.checks_performed += 1
             self._last[check.name] = result
@@ -206,15 +216,19 @@ class ServiceRegistry:
             is_down = streak >= check.down_after
             was_down = self._was_down.get(check.name, False)
             if is_down != was_down:
-                self._events.appendleft(
-                    {
-                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "service": check.name,
-                        "transition": "down" if is_down else "up",
-                        "detail": result.detail,
-                    }
-                )
+                event = {
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "service": check.name,
+                    "transition": "down" if is_down else "up",
+                    "detail": result.detail,
+                }
+                self._events.appendleft(event)
             self._was_down[check.name] = is_down
+        if event is not None and self.on_transition is not None:
+            try:
+                self.on_transition(event)
+            except Exception:  # noqa: BLE001 — a hook failure must not kill the watcher
+                pass
         return result
 
     def snapshot(self) -> dict[str, Any]:
@@ -330,7 +344,7 @@ def demo_checks(dashboard_port: int) -> list[ServiceCheck]:
         ServiceCheck(
             name="dashboard-http",
             kind="http",
-            target=f"http://127.0.0.1:{dashboard_port}/api/state",
+            target=f"http://127.0.0.1:{dashboard_port}/healthz",
             interval=5.0,
         ),
         ServiceCheck(

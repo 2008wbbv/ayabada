@@ -1,12 +1,35 @@
 # Local-network self-host. Product scope only — nothing here participates
 # in scored benchmark runs.
 #
-#   docker compose run --rm agent demo            # offline end-to-end demo
+#   docker compose up dashboard                    # demo dashboard on :8787
+#   AYABADA_TOKEN=secret docker compose up dashboard   # …with bearer-token auth
+#   docker compose run --rm agent demo             # offline end-to-end demo
 #   docker compose run --rm agent heartbeat replay /data/metrics.csv
 #   ANTHROPIC_API_KEY=... docker compose run --rm agent bench run --limit 3
+#
+# Point the dashboard at your real stack by dropping prometheus.yml /
+# services.yml into the ayabada-data volume and appending:
+#   --prometheus /data/prometheus.yml --services /data/services.yml
 services:
+  dashboard:
+    build: .
+    command:
+      - dashboard
+      - --host
+      - 0.0.0.0
+      - --db
+      - /data/ayabada.db
+    ports:
+      - "8787:8787"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AYABADA_TOKEN=${AYABADA_TOKEN:-}
+    volumes:
+      - ayabada-data:/data
+
   agent:
     build: .
+    profiles: ["tools"]   # run on demand: docker compose run --rm agent …
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     volumes:

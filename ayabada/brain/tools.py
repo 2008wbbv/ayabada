@@ -11,14 +11,17 @@ the live cluster, or the web.
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 from pathlib import Path
+from statistics import median, quantiles
 from typing import Any, Callable
 
 from ayabada.snapshot import IncidentSnapshot
 
 MAX_RESULT_CHARS = 8000
+MAX_METRIC_ROWS = 400_000  # cap per metrics file read
 
 
 def _truncate(text: str) -> str:
@@ -45,6 +48,7 @@ class SnapshotToolbox:
             "get_alerts": self._get_alerts,
             "list_entities": self._list_entities,
             "get_events": self._get_events,
+            "query_metrics": self._query_metrics,
             "list_telemetry_files": self._list_telemetry_files,
             "read_telemetry": self._read_telemetry,
             "grep_telemetry": self._grep_telemetry,
@@ -85,6 +89,28 @@ class SnapshotToolbox:
                         "entity": {"type": "string", "description": "Substring filter on object name"},
                         "event_type": {"type": "string", "enum": ["Warning", "Normal"]},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "query_metrics",
+                "description": (
+                    "Summarize metric telemetry for an entity: per-metric sample "
+                    "count, min / median / p95 / max, latest value and trend. "
+                    "Call with no arguments to list entities that have metrics."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "entity": {
+                            "type": "string",
+                            "description": "Entity (pod) name or substring, from list_entities",
+                        },
+                        "metric": {
+                            "type": "string",
+                            "description": "Optional metric-name substring filter",
+                        },
                     },
                     "additionalProperties": False,
                 },
@@ -195,6 +221,98 @@ class SnapshotToolbox:
             for e in rows
         ]
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+    def _metric_files(self) -> dict[str, Path]:
+        """pod name -> metrics TSV, from raw_dir/metrics/pod_<name>_raw.tsv."""
+        root = self._telemetry_root()
+        if root is None:
+            return {}
+        out: dict[str, Path] = {}
+        for path in sorted((root / "metrics").glob("pod_*_raw.tsv")):
+            name = path.stem[len("pod_"):]
+            if name.endswith("_raw"):
+                name = name[: -len("_raw")]
+            out[name] = path
+        return out
+
+    def _query_metrics(self, entity: str = "", metric: str = "") -> str:
+        files = self._metric_files()
+        series_entities = sorted({s.entity for s in self.snapshot.metrics})
+
+        if not entity:
+            available = sorted(set(files) | set(series_entities))
+            if not available:
+                return "No metric telemetry in this snapshot."
+            return "Entities with metrics:\n" + "\n".join(available)
+
+        needle = entity.lower()
+        lines: list[str] = []
+
+        for s in self.snapshot.metrics:
+            if needle in s.entity.lower() and (not metric or metric.lower() in s.metric.lower()):
+                values = [v for _, v in s.samples]
+                lines.append(f"{s.entity} · {s.metric}: {self._summarize(values)}")
+
+        matched_files = {name: path for name, path in files.items() if needle in name.lower()}
+        for name, path in matched_files.items():
+            per_metric, truncated = self._read_metric_file(path, metric)
+            if not per_metric:
+                lines.append(f"{name}: no samples" + (f" matching '{metric}'" if metric else ""))
+                continue
+            lines.append(f"{name}:" + (" (file truncated)" if truncated else ""))
+            for metric_name in sorted(per_metric):
+                lines.append(f"  {metric_name}: {self._summarize(per_metric[metric_name])}")
+
+        if not lines:
+            return f"No metrics found for entity matching '{entity}'."
+        return "\n".join(lines)
+
+    @staticmethod
+    def _read_metric_file(path: Path, metric: str = "") -> tuple[dict[str, list[float]], bool]:
+        per_metric: dict[str, list[float]] = {}
+        rows = 0
+        with path.open(newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            for row in reader:
+                rows += 1
+                if rows > MAX_METRIC_ROWS:
+                    return per_metric, True
+                name = row.get("metric_name", "")
+                if metric and metric.lower() not in name.lower():
+                    continue
+                try:
+                    per_metric.setdefault(name, []).append(float(row.get("value", "")))
+                except ValueError:
+                    continue
+        return per_metric, False
+
+    @staticmethod
+    def _summarize(values: list[float]) -> str:
+        if not values:
+            return "no samples"
+        if len(values) < 4:
+            body = ", ".join(f"{v:g}" for v in values)
+            return f"n={len(values)} values=[{body}]"
+        p95 = quantiles(values, n=20)[18]  # 19 cut points; index 18 is the 95th percentile
+        head = values[: max(1, len(values) // 4)]
+        tail = values[-max(1, len(values) // 4):]
+        head_mean = sum(head) / len(head)
+        tail_mean = sum(tail) / len(tail)
+        base = max(abs(head_mean), 1e-9)
+        change = (tail_mean - head_mean) / base
+        if change > 0.15:
+            trend = f"rising ({change:+.0%})"
+        elif change < -0.15:
+            trend = f"falling ({change:+.0%})"
+        else:
+            trend = "flat"
+        return (
+            f"n={len(values)} min={min(values):g} p50={median(values):g} "
+            f"p95={p95:g} max={max(values):g} last={values[-1]:g} trend={trend}"
+        )
 
     def _telemetry_root(self) -> Path | None:
         return self.snapshot.raw_dir

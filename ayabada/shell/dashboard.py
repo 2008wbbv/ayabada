@@ -35,12 +35,14 @@ from ayabada.brain.loop import RunResult
 from ayabada.brain.tools import SnapshotToolbox
 from ayabada.heartbeat.monitor import Heartbeat, HeartbeatConfig
 from ayabada.shell.handoff import render_handoff
+from ayabada.shell.notify import Notifier
 from ayabada.shell.services import (
     ServiceRegistry,
     ServiceWatcher,
     demo_checks,
     load_services_config,
 )
+from ayabada.shell.store import RETENTION_WEEKS, StateStore
 from ayabada.snapshot import IncidentSnapshot
 
 WINDOW_INTERVALS = 192  # 48h of 15-minute intervals kept for the charts
@@ -123,6 +125,10 @@ class DashboardState:
         self.tool_probe = ToolProbe()
         self.registry = ServiceRegistry()
         self.watcher: ServiceWatcher | None = None
+        self.store: StateStore | None = None
+        self.notifier: Notifier | None = None
+        self.token: str | None = None
+        self._replaying = False
         self._feed_beat_at: float | None = None
         self._feed_done = False
         self._brain_errors = 0
@@ -148,7 +154,9 @@ class DashboardState:
                 )
             self._intervals += 1
             self._last_ts = iso
-            return snapshot
+        if self.store is not None and not self._replaying:
+            self.store.add_observations(iso, observations)
+        return snapshot
 
     def feed_beat(self, done: bool = False) -> None:
         """Feed threads call this once per loop so liveness is observable."""
@@ -165,27 +173,77 @@ class DashboardState:
         handoff = render_handoff(snapshot, run)
         with self._lock:
             self._last_wake_ts = snapshot.window_end
-            self._incidents.append(
-                {
-                    "id": snapshot.id,
-                    "at": snapshot.window_end,
-                    "outcome": "escalated" if run.escalated else "diagnosed",
-                    "entities": [p["name"] for p in run.predictions],
-                    "turns": run.num_turns,
-                    "stop_reason": run.stop_reason,
-                    "final_confidence": (
-                        run.confidence_trace[-1]["confidence"] if run.confidence_trace else None
-                    ),
-                    "metrics": sorted(
-                        {a.labels.get("metric", a.name) for a in snapshot.alerts}
-                    ),
-                }
-            )
+            summary = {
+                "id": snapshot.id,
+                "at": snapshot.window_end,
+                "outcome": "escalated" if run.escalated else "diagnosed",
+                "entities": [p["name"] for p in run.predictions],
+                "turns": run.num_turns,
+                "stop_reason": run.stop_reason,
+                "final_confidence": (
+                    run.confidence_trace[-1]["confidence"] if run.confidence_trace else None
+                ),
+                "metrics": sorted(
+                    {a.labels.get("metric", a.name) for a in snapshot.alerts}
+                ),
+            }
+            self._incidents.append(summary)
             self._incident_detail[snapshot.id] = {
-                "incident": self._incidents[-1],
+                "incident": summary,
                 "handoff": handoff,
                 "run": run.to_dict(),
             }
+        if self.store is not None:
+            self.store.add_incident(
+                snapshot.id, snapshot.window_end,
+                {"incident": summary, "run": run.to_dict()}, handoff,
+            )
+        if self.notifier is not None:
+            if run.escalated:
+                self.notifier.send(
+                    title=f"⚠ Escalated: {snapshot.id}",
+                    body=run.summary or run.escalation_reason,
+                    priority="high",
+                    extra={"incident": summary},
+                )
+            else:
+                entities = ", ".join(summary["entities"]) or "no entity named"
+                self.notifier.send(
+                    title=f"Diagnosed: {snapshot.id}",
+                    body=f"Root cause: {entities} ({run.num_turns} turns). {run.summary}",
+                    priority="default",
+                    extra={"incident": summary},
+                )
+
+    def replay_from_store(self) -> int:
+        """Rehydrate baseline, chart window, gate state and incidents.
+
+        Observations replay through the normal ingest path (so the seasonal
+        baseline and gate end up exactly as they were) but wakes during
+        replay do NOT re-run the brain — those incidents are already stored.
+        """
+        if self.store is None:
+            return 0
+        self._replaying = True
+        try:
+            intervals = 0
+            for ts_iso, observations in self.store.iter_intervals():
+                self.record_interval(datetime.fromisoformat(ts_iso), observations)
+                intervals += 1
+            with self._lock:
+                for incident_id, _at, record, handoff in self.store.load_incidents():
+                    summary = record.get("incident") or {}
+                    self._incidents.append(summary)
+                    self._incident_detail[incident_id] = {
+                        "incident": summary,
+                        "handoff": handoff,
+                        "run": record.get("run") or {},
+                    }
+                    self._last_wake_ts = summary.get("at", self._last_wake_ts)
+            self.registry.seed_events(self.store.load_service_events())
+            return intervals
+        finally:
+            self._replaying = False
 
     # ------------------------------------------------------------------
     # HTTP side
@@ -307,6 +365,29 @@ class DashboardState:
                     "meta": "",
                 }
             )
+
+            if self.store is not None:
+                rows.append(
+                    {
+                        "name": "State store",
+                        "status": "good",
+                        "state_label": "persisted",
+                        "detail": f"{self.store.path} · {self.store.observation_count():,} observations",
+                        "meta": f"{RETENTION_WEEKS}-week retention",
+                    }
+                )
+
+            if self.notifier is not None:
+                stats = self.notifier.stats()
+                rows.append(
+                    {
+                        "name": "Notifications",
+                        "status": "warning" if stats["failed"] > stats["sent"] else "good",
+                        "state_label": "configured",
+                        "detail": f"{len(self.notifier.urls)} webhook(s), format {self.notifier.fmt}",
+                        "meta": f"{stats['sent']} sent · {stats['failed']} failed",
+                    }
+                )
 
             if self.watcher is not None:
                 beat = self.watcher.beat_at
@@ -485,11 +566,25 @@ class ReplayFeed(threading.Thread):
 # ----------------------------------------------------------------------
 
 def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
+    import hmac
+    from http.cookies import SimpleCookie
+
     from ayabada.shell.dashboard_page import PAGE
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (stdlib API)
             parsed = urlparse(self.path)
+            if parsed.path == "/healthz":
+                # Liveness probe: intentionally outside auth so uptime
+                # monitors (including our own self-check) can reach it.
+                self._send_json({"ok": True})
+                return
+            if not self._authorized(parsed):
+                self.send_response(401)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"unauthorized: open /?token=<token> or send Authorization: Bearer <token>")
+                return
             if parsed.path in ("/", "/index.html"):
                 self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             elif parsed.path == "/api/state":
@@ -509,6 +604,30 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             else:
                 self._send(404, b"not found", "text/plain")
 
+        def _authorized(self, parsed) -> bool:
+            """Bearer header, session cookie, or ?token= (which sets the cookie)."""
+            token = state.token
+            if not token:
+                return True
+
+            def matches(candidate: str) -> bool:
+                return hmac.compare_digest(candidate.encode(), token.encode())
+
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer ") and matches(auth[len("Bearer "):].strip()):
+                return True
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            if "ayabada_token" in cookie and matches(cookie["ayabada_token"].value):
+                return True
+            query_token = parse_qs(parsed.query).get("token", [""])[0]
+            if query_token and matches(query_token):
+                # Browser bootstrap: valid ?token= plants the session cookie.
+                self._set_cookie = f"ayabada_token={token}; HttpOnly; SameSite=Lax; Path=/"
+                return True
+            return False
+
+        _set_cookie: str | None = None
+
         def _send_json(self, payload: dict, status: int = 200) -> None:
             self._send(status, json.dumps(payload).encode(), "application/json")
 
@@ -517,6 +636,8 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if self._set_cookie:
+                self.send_header("Set-Cookie", self._set_cookie)
             self.end_headers()
             self.wfile.write(body)
 
@@ -542,9 +663,35 @@ def run_dashboard(
     tick_seconds: float = 1.0,
     model: str | None = None,
     services_path: str | None = None,
+    prometheus_path: str | None = None,
+    db_path: str | None = None,
+    notify_urls: list[str] | None = None,
+    notify_format: str = "json",
+    token: str | None = None,
     log: Callable[[str], None] = print,
 ) -> None:
     state = DashboardState(Heartbeat(HeartbeatConfig()))
+    state.token = token or os.environ.get("AYABADA_TOKEN") or None
+    if state.token:
+        log("token auth enabled")
+
+    if notify_urls:
+        state.notifier = Notifier(urls=list(notify_urls), fmt=notify_format, log=log)
+        log(f"notifications: {len(notify_urls)} webhook(s), format {notify_format}")
+
+    restored = 0
+    if db_path:
+        state.store = StateStore(db_path)
+        restored = state.replay_from_store()
+        if restored:
+            log(f"restored {restored} interval(s) and "
+                f"{len(state.store.load_incidents())} incident(s) from {db_path}")
+        last = state.store.last_ts()
+        if last:
+            cutoff = datetime.fromisoformat(last) - timedelta(weeks=RETENTION_WEEKS)
+            pruned = state.store.prune_before(cutoff.isoformat())
+            if pruned:
+                log(f"pruned {pruned} observation row(s) past {RETENTION_WEEKS}-week retention")
 
     if model:
         from ayabada.llm.anthropic_client import AnthropicClient
@@ -555,17 +702,31 @@ def run_dashboard(
         state.brain_info = {"backend": "scripted", "model": None}
         brain_factory = demo_brain_factory
 
-    if csv_path:
+    if prometheus_path:
+        from ayabada.shell.prometheus import PrometheusFeed, load_prometheus_config
+
+        config = load_prometheus_config(prometheus_path)
+        state.feed_info = {"mode": "prometheus", "tick_seconds": config.interval}
+        feed: threading.Thread = PrometheusFeed(state, config, brain_factory, log=log)
+        log(f"polling {config.url} every {config.interval:g}s "
+            f"({len(config.queries)} queries)")
+    elif csv_path:
         state.feed_info = {"mode": "replay", "tick_seconds": min(tick_seconds, 0.05)}
-        feed: threading.Thread = ReplayFeed(
+        feed = ReplayFeed(
             state, csv_path, brain_factory=brain_factory, tick_seconds=min(tick_seconds, 0.05)
         )
         log(f"replaying {csv_path} through the wake gate…")
     else:
         state.feed_info = {"mode": "demo", "tick_seconds": tick_seconds}
         demo = DemoFeed(state, brain_factory=brain_factory, tick_seconds=tick_seconds)
-        log("warming seasonal baseline (3 simulated weeks)…")
-        demo.prefill()
+        if restored:
+            # Continue simulated time from where the store left off instead
+            # of re-warming (the baseline came back with the replay).
+            demo.ts = datetime.fromisoformat(state.store.last_ts()) + timedelta(minutes=15)
+            log("baseline restored from store; demo continues without re-warming")
+        else:
+            log("warming seasonal baseline (3 simulated weeks)…")
+            demo.prefill()
         feed = demo
     feed.start()
     server = serve(state, host, port)
@@ -580,6 +741,22 @@ def run_dashboard(
         log("no --services file: watching demo self-checks")
     for check in checks:
         state.registry.add(check)
+
+    def on_transition(event: dict) -> None:
+        if state.store is not None:
+            state.store.add_service_event(
+                event["at"], event["service"], event["transition"], event["detail"]
+            )
+        if state.notifier is not None:
+            arrow = "🔴 down" if event["transition"] == "down" else "🟢 up"
+            state.notifier.send(
+                title=f"Service {arrow}: {event['service']}",
+                body=event["detail"],
+                priority="high" if event["transition"] == "down" else "default",
+                extra={"event": event},
+            )
+
+    state.registry.on_transition = on_transition
     state.watcher = ServiceWatcher(state.registry)
     state.watcher.start()
 
