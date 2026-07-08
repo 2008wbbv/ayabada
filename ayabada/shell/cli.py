@@ -174,7 +174,13 @@ def cmd_demo(args: argparse.Namespace) -> int:
 def cmd_dashboard(args: argparse.Namespace) -> int:
     from ayabada.shell.dashboard import run_dashboard
 
-    run_dashboard(host=args.host, port=args.port, csv_path=args.csv, tick_seconds=args.tick)
+    run_dashboard(
+        host=args.host,
+        port=args.port,
+        csv_path=args.csv,
+        tick_seconds=args.tick,
+        model=args.model,
+    )
     return 0
 
 
@@ -217,6 +223,10 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument(
         "--tick", type=float, default=1.0,
         help="seconds per 15-min interval in demo mode (time compression)",
+    )
+    dashboard.add_argument(
+        "--model",
+        help="run the real brain on wakes via the Anthropic API (default: scripted demo brain)",
     )
     dashboard.set_defaults(func=cmd_dashboard)
 

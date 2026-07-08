@@ -161,6 +161,12 @@ PAGE = r"""<!DOCTYPE html>
   <div class="cards smalls" id="smalls"></div>
 
   <section class="card">
+    <h2>Self-host services</h2>
+    <p class="desc">Health of the stack itself: the dashboard, the feed driving the wake gate, the brain that runs on wakes, and the action-layer tools available on this host.</p>
+    <div id="services"></div>
+  </section>
+
+  <section class="card">
     <h2>Incidents</h2>
     <p class="desc">Every wake, what the brain concluded, and the handoff written for a human. Click a row to read the handoff.</p>
     <div id="incidents"></div>
@@ -434,6 +440,32 @@ function renderSmalls(data) {
   }
 }
 
+const SERVICE_STATUS = { good: "--status-good", warning: "--status-warning", critical: "--status-critical" };
+
+function renderServices(data) {
+  const mount = document.getElementById("services");
+  mount.textContent = "";
+  if (!data || !data.services) return;
+  const table = el("table");
+  table.append(el("thead", {}, el("tr", {},
+    el("th", { text: "Service" }), el("th", { text: "Status" }),
+    el("th", { text: "Detail" }), el("th", { text: "" }))));
+  const tbody = el("tbody");
+  for (const svc of data.services) {
+    const badge = el("span", { class: "badge" });
+    const dot = el("span", { class: "statusdot" });
+    dot.style.background = css(SERVICE_STATUS[svc.status] || "--status-warning");
+    badge.append(dot, document.createTextNode(svc.state_label));
+    tbody.append(el("tr", {},
+      el("td", { text: svc.name }),
+      el("td", {}, badge),
+      el("td", { text: svc.detail }),
+      el("td", { text: svc.meta || "" })));
+  }
+  table.append(tbody);
+  mount.append(table);
+}
+
 function outcomeBadge(inc) {
   const badge = el("span", { class: "badge" });
   const dot = el("span", { class: "statusdot" });
@@ -498,12 +530,14 @@ for (const chip of document.querySelectorAll(".chip[data-range]")) {
 }
 
 let latest = null;
+let latestServices = null;
 function renderAll() {
   if (!latest) return;
   document.getElementById("clock").textContent = latest.now ? latest.now.replace("T", " ") : "—";
   renderKpis(latest);
   renderZChart(latest);
   renderSmalls(latest);
+  renderServices(latestServices);
   renderIncidents(latest);
 }
 async function refresh() {
@@ -514,8 +548,18 @@ async function refresh() {
     renderAll();
   } catch (e) { /* keep the previous render; retry on next tick */ }
 }
+async function refreshServices() {
+  try {
+    const resp = await fetch("/api/services");
+    if (!resp.ok) return;
+    latestServices = await resp.json();
+    renderServices(latestServices);
+  } catch (e) { /* keep the previous render */ }
+}
 refresh();
+refreshServices();
 setInterval(refresh, 2000);
+setInterval(refreshServices, 10000);
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", renderAll);
 </script>
 </body>
