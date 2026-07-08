@@ -52,10 +52,12 @@ pytest                                   # 70 tests, all offline
 ayabada demo
 
 # Web dashboard (zero dependencies): live gate state, z-score chart with
-# thresholds and wake markers, per-metric small multiples, incident table
-# with handoff viewer. Demo feed is time-compressed (1 tick = 15 min).
+# thresholds and wake markers, per-metric small multiples, self-host
+# services panel, incident table with handoff viewer. Demo feed is
+# time-compressed (1 tick = 15 min).
 ayabada dashboard                        # http://127.0.0.1:8787/
 ayabada dashboard --csv metrics.csv      # replay real metrics instead
+ayabada dashboard --services services.yml  # health-check your own services
 
 # Scored benchmark, offline plumbing check (scripted model)
 ayabada bench fetch --limit 1
@@ -101,6 +103,35 @@ holds a streak through borderline intervals; a cooldown stops re-waking on
 the same episode; flagged special days (Black Friday) widen the bands. In
 the included simulation it produces zero false wakes over three clean weeks
 and exactly one wake per injected incident.
+
+## Watched services
+
+The dashboard's services panel health-checks whatever you self-host,
+declared in a YAML file:
+
+```yaml
+services:
+  - name: website          # HTTP 2xx/3xx within timeout
+    kind: http
+    target: https://example.com/health
+    interval: 30           # seconds (default 30)
+  - name: postgres         # TCP connect
+    kind: tcp
+    target: "127.0.0.1:5432"
+  - name: grafana          # docker container running
+    kind: docker
+    target: grafana
+  - name: backup-timer     # exit code 0
+    kind: command
+    target: "systemctl is-active backups.timer"
+```
+
+Each service shows status (up / slow / failing / down), current latency with
+a sparkline, uptime % over the recent window, and every up↔down transition
+lands in an event log. `down` requires `down_after` consecutive failures
+(default 2) so one dropped packet doesn't page anyone. Without `--services`
+the demo watches its own HTTP/TCP endpoints plus a deliberately unreachable
+example so all states are visible.
 
 ## Results format
 

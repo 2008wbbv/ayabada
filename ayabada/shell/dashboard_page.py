@@ -119,6 +119,14 @@ PAGE = r"""<!DOCTYPE html>
   .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; }
   .empty { color: var(--text-muted); padding: 14px 10px; }
 
+  .grouphead { font-size: 12.5px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 16px 0 4px; }
+  .spark { display: block; }
+  .eventlog { margin-top: 8px; }
+  .eventlog .ev { display: flex; gap: 10px; align-items: baseline; color: var(--text-secondary); font-size: 12.5px; padding: 3px 10px; }
+  .eventlog .ev .when { color: var(--text-muted); font-variant-numeric: tabular-nums; flex: none; }
+  .eventlog .ev .what { font-weight: 600; }
+  code { background: color-mix(in srgb, var(--text-muted) 12%, transparent); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+
   .handoff { display: none; margin-top: 14px; }
   .handoff pre {
     margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
@@ -162,7 +170,11 @@ PAGE = r"""<!DOCTYPE html>
 
   <section class="card">
     <h2>Self-host services</h2>
-    <p class="desc">Health of the stack itself: the dashboard, the feed driving the wake gate, the brain that runs on wakes, and the action-layer tools available on this host.</p>
+    <p class="desc">Watched services are health-checked on their own intervals (HTTP, TCP, docker, command — declared in <code>--services services.yml</code>). The agent stack below them is the health of this deployment itself.</p>
+    <h3 class="grouphead">Watched services</h3>
+    <div id="watched"></div>
+    <div class="eventlog" id="svc-events"></div>
+    <h3 class="grouphead">Agent stack</h3>
     <div id="services"></div>
   </section>
 
@@ -442,23 +454,88 @@ function renderSmalls(data) {
 
 const SERVICE_STATUS = { good: "--status-good", warning: "--status-warning", critical: "--status-critical" };
 
+function statusBadge(status, label) {
+  const badge = el("span", { class: "badge" });
+  const dot = el("span", { class: "statusdot" });
+  dot.style.background = css(SERVICE_STATUS[status] || "--status-warning");
+  badge.append(dot, document.createTextNode(label));
+  return badge;
+}
+
+/* 12–30 point latency sparkline; gaps where checks failed. */
+function sparkline(values) {
+  const W = 110, H = 26, P = 3;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: "spark" });
+  const nums = values.filter(v => v !== null);
+  if (!nums.length) return svg;
+  const lo = Math.min(...nums), hi = Math.max(...nums);
+  const span = (hi - lo) || 1;
+  const X = i => P + (values.length === 1 ? (W - 2 * P) / 2 : (i / (values.length - 1)) * (W - 2 * P));
+  const Y = v => H - P - ((v - lo) / span) * (H - 2 * P);
+  let d = "", pen = false;
+  values.forEach((v, i) => {
+    if (v === null) { pen = false; return; }
+    d += (pen ? " L " : " M ") + X(i).toFixed(1) + "," + Y(v).toFixed(1);
+    pen = true;
+  });
+  svg.append(svgEl("path", { d: d.trim(), fill: "none", stroke: css("--series-1"), "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  const lastIdx = values.length - 1 - [...values].reverse().findIndex(v => v !== null);
+  if (values[lastIdx] !== null) {
+    svg.append(svgEl("circle", { cx: X(lastIdx), cy: Y(values[lastIdx]), r: 2.5, fill: css("--series-1") }));
+  }
+  return svg;
+}
+
+function renderWatched(data) {
+  const mount = document.getElementById("watched");
+  mount.textContent = "";
+  if (!data || !data.watched || !data.watched.length) {
+    mount.append(el("div", { class: "empty", text: "No services configured — pass --services services.yml" }));
+    return;
+  }
+  const table = el("table");
+  table.append(el("thead", {}, el("tr", {},
+    el("th", { text: "Service" }), el("th", { text: "Status" }), el("th", { text: "Latency" }),
+    el("th", { text: "" }), el("th", { text: "Uptime" }), el("th", { text: "Detail" }))));
+  const tbody = el("tbody");
+  for (const svc of data.watched) {
+    tbody.append(el("tr", {},
+      el("td", {}, el("span", { text: svc.name + " " }), el("span", { class: "t-name", text: svc.kind })),
+      el("td", {}, statusBadge(svc.status, svc.state_label)),
+      el("td", { text: svc.latency_ms !== null ? fmt(svc.latency_ms) + " ms" : "—" }),
+      el("td", {}, sparkline(svc.spark || [])),
+      el("td", { text: svc.uptime_pct !== null ? svc.uptime_pct.toFixed(1) + "%" : "—" }),
+      el("td", { text: svc.detail + (svc.checked_ago_s !== null ? ` · checked ${Math.round(svc.checked_ago_s)}s ago` : "") })));
+  }
+  table.append(tbody);
+  mount.append(table);
+
+  const log = document.getElementById("svc-events");
+  log.textContent = "";
+  for (const ev of (data.events || []).slice(0, 6)) {
+    const row = el("div", { class: "ev" });
+    row.append(
+      el("span", { class: "when", text: ev.at }),
+      el("span", { class: "what", text: `${ev.service} → ${ev.transition}` }),
+      el("span", { text: ev.detail }));
+    log.append(row);
+  }
+}
+
 function renderServices(data) {
+  renderWatched(data);
   const mount = document.getElementById("services");
   mount.textContent = "";
-  if (!data || !data.services) return;
+  if (!data || !data.stack) return;
   const table = el("table");
   table.append(el("thead", {}, el("tr", {},
     el("th", { text: "Service" }), el("th", { text: "Status" }),
     el("th", { text: "Detail" }), el("th", { text: "" }))));
   const tbody = el("tbody");
-  for (const svc of data.services) {
-    const badge = el("span", { class: "badge" });
-    const dot = el("span", { class: "statusdot" });
-    dot.style.background = css(SERVICE_STATUS[svc.status] || "--status-warning");
-    badge.append(dot, document.createTextNode(svc.state_label));
+  for (const svc of data.stack) {
     tbody.append(el("tr", {},
       el("td", { text: svc.name }),
-      el("td", {}, badge),
+      el("td", {}, statusBadge(svc.status, svc.state_label)),
       el("td", { text: svc.detail }),
       el("td", { text: svc.meta || "" })));
   }
@@ -559,7 +636,7 @@ async function refreshServices() {
 refresh();
 refreshServices();
 setInterval(refresh, 2000);
-setInterval(refreshServices, 10000);
+setInterval(refreshServices, 5000);
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", renderAll);
 </script>
 </body>

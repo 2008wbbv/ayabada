@@ -35,6 +35,12 @@ from ayabada.brain.loop import RunResult
 from ayabada.brain.tools import SnapshotToolbox
 from ayabada.heartbeat.monitor import Heartbeat, HeartbeatConfig
 from ayabada.shell.handoff import render_handoff
+from ayabada.shell.services import (
+    ServiceRegistry,
+    ServiceWatcher,
+    demo_checks,
+    load_services_config,
+)
 from ayabada.snapshot import IncidentSnapshot
 
 WINDOW_INTERVALS = 192  # 48h of 15-minute intervals kept for the charts
@@ -115,6 +121,8 @@ class DashboardState:
         self.feed_info: dict[str, Any] = {"mode": "none", "tick_seconds": 0.0}
         self.brain_info: dict[str, Any] = {"backend": "scripted demo brain", "model": None}
         self.tool_probe = ToolProbe()
+        self.registry = ServiceRegistry()
+        self.watcher: ServiceWatcher | None = None
         self._feed_beat_at: float | None = None
         self._feed_done = False
         self._brain_errors = 0
@@ -300,6 +308,22 @@ class DashboardState:
                 }
             )
 
+            if self.watcher is not None:
+                beat = self.watcher.beat_at
+                stalled = beat is None or (now - beat) > 15.0
+                rows.append(
+                    {
+                        "name": "Service watcher",
+                        "status": "warning" if stalled else "good",
+                        "state_label": "stalled" if stalled else "running",
+                        "detail": (
+                            f"{len(self.registry.names)} service(s) watched · "
+                            f"{self.registry.checks_performed} checks performed"
+                        ),
+                        "meta": "",
+                    }
+                )
+
             for tool in tools:
                 rows.append(
                     {
@@ -310,7 +334,9 @@ class DashboardState:
                         "meta": "action layer",
                     }
                 )
-            return {"services": rows}
+
+        watched = self.registry.snapshot()  # registry has its own lock
+        return {"stack": rows, **watched}
 
 
 # ----------------------------------------------------------------------
@@ -515,6 +541,7 @@ def run_dashboard(
     csv_path: str | None = None,
     tick_seconds: float = 1.0,
     model: str | None = None,
+    services_path: str | None = None,
     log: Callable[[str], None] = print,
 ) -> None:
     state = DashboardState(Heartbeat(HeartbeatConfig()))
@@ -542,8 +569,21 @@ def run_dashboard(
         feed = demo
     feed.start()
     server = serve(state, host, port)
-    state.address = f"http://{host}:{port}"
-    log(f"dashboard: http://{host}:{port}/")
+    bound_port = server.server_address[1]
+    state.address = f"http://{host}:{bound_port}"
+
+    if services_path:
+        checks = load_services_config(services_path)
+        log(f"watching {len(checks)} service(s) from {services_path}")
+    else:
+        checks = demo_checks(bound_port)
+        log("no --services file: watching demo self-checks")
+    for check in checks:
+        state.registry.add(check)
+    state.watcher = ServiceWatcher(state.registry)
+    state.watcher.start()
+
+    log(f"dashboard: http://{host}:{bound_port}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

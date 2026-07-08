@@ -20,7 +20,7 @@ def fresh_state() -> DashboardState:
 
 
 def rows_by_name(state: DashboardState) -> dict[str, dict]:
-    return {row["name"]: row for row in state.services_json()["services"]}
+    return {row["name"]: row for row in state.services_json()["stack"]}
 
 
 def test_feed_states_starting_running_stalled_complete():
@@ -108,9 +108,10 @@ def test_services_endpoint():
         data = json.loads(
             urllib.request.urlopen(f"http://127.0.0.1:{port}/api/services").read()
         )
-        names = [row["name"] for row in data["services"]]
+        names = [row["name"] for row in data["stack"]]
         assert names[:4] == ["Dashboard server", "Heartbeat feed", "Agent brain", "Doc handoff"]
         assert {"docker", "kubectl", "git"} <= set(names)
-        assert all(row["status"] in ("good", "warning", "critical") for row in data["services"])
+        assert all(row["status"] in ("good", "warning", "critical") for row in data["stack"])
+        assert data["watched"] == [] and data["events"] == []
     finally:
         server.shutdown()

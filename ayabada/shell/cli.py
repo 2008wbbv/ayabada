@@ -180,6 +180,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         csv_path=args.csv,
         tick_seconds=args.tick,
         model=args.model,
+        services_path=args.services,
     )
     return 0
 
@@ -227,6 +228,11 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument(
         "--model",
         help="run the real brain on wakes via the Anthropic API (default: scripted demo brain)",
+    )
+    dashboard.add_argument(
+        "--services",
+        help="YAML file of services to health-check (http/tcp/docker/command); "
+        "default: demo self-checks",
     )
     dashboard.set_defaults(func=cmd_dashboard)
 
